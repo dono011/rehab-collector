@@ -24,6 +24,7 @@
 
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import datetime
@@ -149,6 +150,64 @@ def fetch(url, params=None):
         except (UnicodeDecodeError, LookupError):
             continue
     return r.content.decode("utf-8", errors="replace"), None
+
+
+# ─────────────────────────────────────────────────────────
+# 공고 원문 열람
+#
+# 목록에는 회사명·법원·날짜만 있고 사건번호·관리인·연락처가 없다.
+# 전화 확인을 하려면 이 정보가 필요하므로 상세 페이지를 열어 뽑아낸다.
+#
+# 상세 페이지 구조는 확인되지 않았으므로, 태그를 걷어낸 본문에서
+# 정규식으로 찾는 방식을 쓴다. 못 찾으면 원문을 파일로 남겨
+# 사람이 직접 읽을 수 있게 한다.
+# ─────────────────────────────────────────────────────────
+
+# 다음 항목이 시작되는 지점 — 값을 어디서 끊을지 판단하는 데 쓴다.
+_NEXT_FIELD = r"(?=\s*(?:인수|제출|문의|연락|접수|일시|기한|담당|주소|$))"
+
+DETAIL_PATTERNS = [
+    ("사건번호", re.compile(r"(20\d{2}\s?(?:간회합|회합|회단|하합|하단|개회)\s?\d+)")),
+    # 이름 뒤에 조사가 붙는 경우가 많아(관리인 김철수는), 조사를 경계로 끊는다
+    ("관리인", re.compile(r"관리인\s*[:：]?\s*([가-힣]{2,4}?)"
+                       r"(?=(?:은|는|이|가|께서|씨)?\s)")),
+    ("매각주간사", re.compile(r"매각\s*주간사\s*[:：]?\s*(.{2,25}?)" + _NEXT_FIELD)),
+    ("전화", re.compile(r"(0\d{1,2}[-)\s]\d{3,4}[-\s]\d{4})")),
+    ("이메일", re.compile(r"([\w.+-]+@[\w-]+\.[\w.]+)")),
+    ("제출기한", re.compile(r"(?:제출\s*기한|접수\s*마감|입찰\s*일시)\s*[:：]?\s*"
+                        r"(20\d{2}[.\-년]\s?\d{1,2}[.\-월]\s?\d{1,2})")),
+]
+
+
+def fetch_detail(url, save_dir=None, slug=""):
+    """공고 원문에서 확인 작업에 필요한 항목을 뽑는다."""
+    if not url:
+        return {}
+    html, err = fetch(url)
+    if err:
+        return {"_error": err}
+
+    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html,
+                  flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;?", " ", text)
+    text = " ".join(text.split())
+
+    found = {}
+    for name, pattern in DETAIL_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            found[name] = " ".join(m.group(1).split())
+
+    # 정규식이 놓친 내용을 사람이 읽을 수 있도록 원문을 남긴다
+    if save_dir and slug:
+        safe = re.sub(r"[^\w가-힣]+", "_", slug)[:40].strip("_")
+        path = Path(save_dir) / f"{safe}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{url}\n\n{text}", encoding="utf-8")
+        found["_원문"] = str(path)
+
+    return found
 
 
 def parse_page(site, html, url):
@@ -339,6 +398,9 @@ def main():
                    help="전기 관련 후보만 (관련도 2 이상)")
     p.add_argument("--tsv", action="store_true",
                    help="엑셀에 붙여넣을 수 있는 표 형태로 화면 출력")
+    p.add_argument("--detail", action="store_true",
+                   help="공고 원문을 열어 사건번호·관리인·연락처까지 확보 "
+                        "(건수만큼 시간이 걸리므로 --elec 와 함께 쓰세요)")
     args = p.parse_args()
 
     if args.codes:
@@ -421,6 +483,39 @@ def main():
 
     new_rows.sort(key=lambda r: -r["_score"])
 
+    if args.detail:
+        log(f"\n[2.5/3] 공고 원문 열람 ({len(new_rows)}건)")
+        detail_dir = OUT_DIR / "detail"
+        for n, row in enumerate(new_rows, 1):
+            info = fetch_detail(row.get("_link", ""), detail_dir, row["회사명"])
+            if info.get("_error"):
+                log(f"  [{n}/{len(new_rows)}] {row['회사명']} — 열람 실패: {info['_error']}")
+                time.sleep(DELAY)
+                continue
+
+            row["사건번호"] = info.get("사건번호", row.get("사건번호", ""))
+            row["_관리인"] = info.get("관리인", "")
+            row["_연락처"] = info.get("전화", "") or info.get("이메일", "")
+            row["_주간사"] = info.get("매각주간사", "")
+            row["_기한"] = info.get("제출기한", "")
+
+            bits = [f"{k} {v}" for k, v in
+                    (("사건", row["사건번호"]), ("관리인", row["_관리인"]),
+                     ("연락처", row["_연락처"]), ("주간사", row["_주간사"]))
+                    if v]
+            log(f"  [{n}/{len(new_rows)}] {row['회사명']} — "
+                + (" | ".join(bits) if bits else "추출 항목 없음 (원문 저장됨)"))
+
+            extra = [f"관리인 {row['_관리인']}" if row["_관리인"] else "",
+                     f"연락처 {row['_연락처']}" if row["_연락처"] else "",
+                     f"주간사 {row['_주간사']}" if row["_주간사"] else "",
+                     f"제출기한 {row['_기한']}" if row["_기한"] else ""]
+            extra = [e for e in extra if e]
+            if extra:
+                row["비고"] = (" / ".join(extra) + " | " + row["비고"])[:400]
+            time.sleep(DELAY)
+        log(f"\n  원문 저장 위치: {detail_dir}")
+
     log("\n[3/3] 엑셀 저장")
     out_path = OUT_DIR / f"법원공고_회생업체_{today:%Y%m%d}.xlsx"
     write_excel(new_rows, out_path)
@@ -457,7 +552,9 @@ def print_tsv(rows):
     파일을 서버 밖으로 꺼내기 번거로우므로, 화면을 복사해
     엑셀에 붙이면 칸이 자동으로 나뉘도록 탭으로 구분한다.
     """
-    cols = ["회사명", "관할법원", "업종", "공고일", "관련도", "판단근거", "원문링크"]
+    cols = ["회사명", "관할법원", "업종", "공고일", "관련도", "판단근거",
+            "사건번호", "관리인", "연락처", "매각주간사", "제출기한",
+            "확인여부", "메모", "원문링크"]
     log("")
     log("─" * 62)
     log("  아래 표 전체를 복사해 엑셀 A1 칸에 붙여넣으세요 (칸이 자동으로 나뉩니다)")
@@ -475,6 +572,13 @@ def print_tsv(rows):
             r["결정일"] or r["신청일"],
             str(r["_score"]),
             basis,
+            r.get("사건번호", ""),
+            r.get("_관리인", ""),
+            r.get("_연락처", ""),
+            r.get("_주간사", ""),
+            r.get("_기한", ""),
+            "",          # 확인여부 — 직접 채우실 칸
+            "",          # 메모 — 직접 채우실 칸
             r.get("_link", ""),
         ]))
     log("")
