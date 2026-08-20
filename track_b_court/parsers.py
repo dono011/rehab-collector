@@ -42,11 +42,21 @@ STATUS_MAP = [
 ]
 
 # 전기 관련 회사명 키워드 → 가중치
+#
+# 2026-08-20 실제 수집 결과(311건)를 보고 조정했다.
+#   3점: 전기공사업일 가능성이 높은 어휘
+#   2점: 전기 계열이지만 공사업이 아닐 수 있는 어휘 (제조·발전 등)
+#   1점: 약한 신호
 ELEC_KEYWORDS = [
-    ("전기공사", 3), ("전기설비", 3), ("전설", 3),
-    ("전기", 2), ("전력", 2), ("배전", 2), ("송전", 2), ("변전", 2),
-    ("파워", 1), ("power", 1), ("electric", 2), ("elec", 1),
-    ("에너지", 1), ("발전", 1), ("계전", 2), ("전공", 1),
+    # 3점 — 전기공사·송배전 계열
+    ("전기공사", 3), ("전기설비", 3), ("전설", 3), ("전기", 3),
+    ("전력", 3), ("배전", 3), ("송전", 3), ("변전", 3), ("계전", 3),
+    # 2점 — 전기 계열 (제조·발전·조명 포함)
+    ("파워", 2), ("power", 2), ("일렉트", 2), ("electric", 2),
+    ("케이블", 2), ("에너지", 2), ("발전", 2),
+    ("솔라", 2), ("solar", 2), ("조명", 2), ("라이텍", 2),
+    # 1점 — 약한 신호
+    ("전자", 1), ("전공", 1), ("elec", 1),
 ]
 
 # 회생 관련 공고만 남기기 위한 키워드
@@ -381,10 +391,15 @@ BUSINESS_CODES = {
 }
 
 # 전기공사업이 속할 가능성이 있는 업종 → 가중치
+#
+# ⚠️ "건설,엔지니어링,설계"(08)를 높게 잡으면 삼부토건·경남기업 같은
+#    종합건설사가 무더기로 딸려 온다. 실제 수집 결과 51건 중 20건 가까이가
+#    그런 잡음이었다. 그래서 08은 참고 수준(1점)으로 낮춘다.
+#    전기공사업체는 대개 회사명에 신호가 있으므로 이름 쪽에서 잡힌다.
 BUSINESS_SCORE = {
-    "08": 3,   # 건설,엔지니어링,설계  ← 전기공사업의 주된 분류
     "02": 2,   # 제조업(전기전자)
     "09": 2,   # 가스,에너지,수도
+    "08": 1,   # 건설,엔지니어링,설계 — 종합건설이 대다수
 }
 
 # bub_cd 파라미터 코드 → 법원명 (실제 페이지에서 확인한 전체)
@@ -450,12 +465,13 @@ def parse_ma_notice(html, base_url=""):
             if href and not href.lower().startswith("javascript"):
                 link = urljoin(base_url, href) if base_url else href
 
-        # 관련도: 법원 업종 분류와 회사명 키워드 중 높은 쪽
-        score = 0
+        # 회사명 신호와 업종 신호를 따로 매긴다.
+        # 합쳐버리면 어느 쪽에서 걸린 건지 알 수 없어 잡음 판별이 안 된다.
+        name_score = elec_score(company)
+        induty_score = 0
         for code, weight in BUSINESS_SCORE.items():
             if BUSINESS_CODES[code] in induty:
-                score = max(score, weight)
-        score = max(score, elec_score(company, induty))
+                induty_score = max(induty_score, weight)
 
         records.append({
             "번호": no,
@@ -467,7 +483,9 @@ def parse_ma_notice(html, base_url=""):
             "링크": link,
             "사건번호": extract_case_no(induty_cell) or "",
             "상태": "매각",
-            "관련도": score,
+            "관련도": max(name_score, induty_score),
+            "이름점수": name_score,
+            "업종점수": induty_score,
         })
 
     return records

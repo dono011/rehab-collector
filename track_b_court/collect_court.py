@@ -249,6 +249,9 @@ def to_row(rec, today):
         "데이터출처": rec.get("_source", "법원공고"),
         "비고": " ".join(note)[:400],
         "_score": score,
+        "_name_score": rec.get("이름점수", 0),
+        "_induty_score": rec.get("업종점수", 0),
+        "_link": rec.get("링크", ""),
         "_key": f"{rec.get('_source','')}|{rec.get('번호','')}|{rec.get('회사명','')}",
     }
 
@@ -331,6 +334,11 @@ def main():
                    help="업종코드로 좁혀 받기 (예: 08 건설·엔지니어링). "
                         "기본은 전체 — 법원 분류가 느슨해 좁히면 놓친다")
     p.add_argument("--codes", action="store_true", help="업종·법원 코드표 출력")
+    p.add_argument("--since", help="이 날짜 이후 공고만 (예: 2025-01-01)")
+    p.add_argument("--elec", action="store_true",
+                   help="전기 관련 후보만 (관련도 2 이상)")
+    p.add_argument("--tsv", action="store_true",
+                   help="엑셀에 붙여넣을 수 있는 표 형태로 화면 출력")
     args = p.parse_args()
 
     if args.codes:
@@ -385,6 +393,21 @@ def main():
     all_records = parsers.dedupe(all_records)
     log(f"\n  → 중복 제거 후 {len(all_records)}건")
 
+    if args.since:
+        before = len(all_records)
+        all_records = [r for r in all_records if (r.get("날짜") or "") >= args.since]
+        log(f"  → {args.since} 이후 {len(all_records)}건 "
+            f"({before - len(all_records)}건 제외)")
+
+    if args.elec:
+        before = len(all_records)
+        all_records = [r for r in all_records if r.get("관련도", 0) >= 2]
+        log(f"  → 전기 관련 {len(all_records)}건 ({before - len(all_records)}건 제외)")
+
+    if not all_records:
+        log("\n조건에 맞는 공고가 없습니다. --since 날짜를 앞당기거나 --elec 를 빼보세요.")
+        return 0
+
     log("\n[2/3] 신규 선별")
     seen = set() if args.all else set(load_json(SEEN_FILE, []))
     rows = [to_row(r, today.strftime("%Y-%m-%d")) for r in all_records]
@@ -408,15 +431,53 @@ def main():
     log("\n" + "=" * 62)
     log(f"  신규 {len(new_rows)}건 저장 | 전기 관련 후보 {len(hits)}건")
     log("=" * 62)
+
+    if args.tsv:
+        print_tsv(new_rows)
+        return 0
+
     if hits:
-        log("\n  ★ 전기 관련 후보 (회사명 기준 추정)")
+        log("\n  ★ 전기 관련 후보")
         for r in hits:
-            log(f"     · {r['회사명']} [{r['사건상태']}] "
-                f"{r['관할법원']} {r['사건번호']}")
-        log("\n  ⚠️ 회사명 추정이므로 전기공사업 등록 여부는")
+            src = "이름" if r["_name_score"] >= 2 else "업종"
+            log(f"     · {r['회사명']} | {r['관할법원']} | {r['결정일'] or r['신청일']} "
+                f"| {r['면허/업종']} ({src})")
+        log("\n  ⚠️ 자동 추정입니다. 전기공사업 등록 여부는")
         log("     한국전기공사협회(02-2670-5000) 확인이 필요합니다.")
     log("")
+    log("  엑셀로 옮기려면:  같은 명령에 --tsv 를 붙여 실행 후 화면을 복사")
+    log("")
     return 0
+
+
+def print_tsv(rows):
+    """
+    엑셀에 그대로 붙여넣을 수 있는 탭 구분 표를 화면에 출력한다.
+
+    파일을 서버 밖으로 꺼내기 번거로우므로, 화면을 복사해
+    엑셀에 붙이면 칸이 자동으로 나뉘도록 탭으로 구분한다.
+    """
+    cols = ["회사명", "관할법원", "업종", "공고일", "관련도", "판단근거", "원문링크"]
+    log("")
+    log("─" * 62)
+    log("  아래 표 전체를 복사해 엑셀 A1 칸에 붙여넣으세요 (칸이 자동으로 나뉩니다)")
+    log("─" * 62)
+    log("")
+    log("\t".join(cols))
+    for r in rows:
+        basis = ("회사명" if r["_name_score"] >= 2
+                 else "업종" if r["_induty_score"] >= 2
+                 else "참고")
+        log("\t".join([
+            r["회사명"],
+            r["관할법원"],
+            r["면허/업종"],
+            r["결정일"] or r["신청일"],
+            str(r["_score"]),
+            basis,
+            r.get("_link", ""),
+        ]))
+    log("")
 
 
 if __name__ == "__main__":
