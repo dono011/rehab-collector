@@ -1,0 +1,6 @@
+output/seen.json
+output/company_cache.json
+output/cron.log
+output/회생신청_정보_*.xlsx
+dart_key.txt
+__pycache__/
