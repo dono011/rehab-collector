@@ -300,13 +300,17 @@ def run_check():
         if err:
             log(f"    접근       : ❌ {err}")
             continue
-        found = parsers.parse_auto(html, base_url=site["url"])
+        found = parse_page(site, html, site["url"])
         log(f"    접근       : ✅ HTTP 200 / {len(html):,}자")
         log(f"    파싱       : {len(found)}건 추출")
         if found:
             ok += 1
-            for r in found[:3]:
-                log(f"      · {r['회사명']} ({r['상태']}) {r['사건번호']}")
+            for r in found[:5]:
+                mark = "★" if r.get("관련도", 0) >= 2 else "·"
+                log(f"      {mark} {r['회사명']} | {r.get('법원','')} | "
+                    f"{r.get('업종','')} | {r.get('날짜','')}")
+            if len(found) > 5:
+                log(f"      … 외 {len(found) - 5}건")
         else:
             log("      → 추출 0건. probe.py 로 구조를 확인하세요.")
         time.sleep(DELAY)
@@ -351,7 +355,7 @@ def main():
             log(f"파일이 없습니다: {path}")
             return 1
         html = path.read_text(encoding="utf-8", errors="replace")
-        records = parsers.parse_auto(html, base_url="https://www.scourt.go.kr")
+        records = parse_page(SITES[0], html, MA_NOTICE_URL)
         log(f"{path.name} → {len(records)}건 추출\n")
         for r in records:
             mark = "★" if r["관련도"] >= 2 else " "
