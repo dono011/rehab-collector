@@ -33,6 +33,8 @@ from openpyxl.utils import get_column_letter
 
 BASE = "https://opendart.fss.or.kr/api"
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+import categories as CAT  # noqa: E402
 OUT_DIR = HERE / "output"
 SEEN_FILE = OUT_DIR / "seen.json"
 CACHE_FILE = OUT_DIR / "company_cache.json"
@@ -46,16 +48,26 @@ PBLNTF_TYPES = ["B", "I"]
 # 엑셀 컬럼 (원 기획서 16개 항목)
 COLUMNS = [
     "수집일자", "회사명", "사업자번호", "대표자명", "관할법원", "사건번호",
-    "신청일", "결정일", "사건상태", "면허/업종", "자본금", "채무액",
+    "신청일", "결정일", "사건상태", "면허/업종", "분류", "판단근거", "자본금", "채무액",
     "소재지", "전화번호", "데이터출처", "비고",
 ]
 
 # 한국표준산업분류 접두어 → 전기 관련도
+# 2026-08-21 확대: 전기만 보다가 사장님 지시로 건설·소방·설비통신까지 넣었다.
+# 긴 접두어가 먼저 와야 한다 (423 이 42 보다 먼저 걸려야 전기로 잡힌다).
 INDUTY_GROUPS = [
-    ("422", "전기·통신공사업", 3),
-    ("28",  "전기장비 제조업", 2),
-    ("351", "전기업(발전·송배전)", 2),
-    ("261", "반도체·전자부품", 1),
+    ("4231", "전기공사업", "전기", 3),
+    ("4232", "통신공사업", "설비통신", 3),
+    ("423",  "전기·통신공사업", "전기", 3),
+    ("422",  "건물설비 설치공사업(배관·냉난방·소방)", "설비통신", 3),
+    ("421",  "기반조성·시설물축조 공사업", "건설", 3),
+    ("424",  "실내건축·건축마무리 공사업", "건설", 3),
+    ("425",  "건설 시설물 유지관리업", "건설", 3),
+    ("42",   "전문직별 공사업", "건설", 3),
+    ("41",   "종합 건설업", "건설", 3),
+    ("351",  "전기업(발전·송배전)", "전기", 2),
+    ("28",   "전기장비 제조업", "전기", 2),
+    ("261",  "반도체·전자부품", "전기", 1),
 ]
 
 DART_ERRORS = {
@@ -140,25 +152,47 @@ def save_json(path, obj):
 # 수집
 # ─────────────────────────────────────────────────────────
 
+def split_periods(bgn_de, end_de, max_days=80):
+    """DART는 corp_code 없이 조회하면 **3개월까지만** 허용한다.
+    (2026-08-21 확인: 6개월로 부르면 status 100 "검색기간은 3개월만 가능합니다")
+    그래서 긴 기간은 잘라서 여러 번 부른다. 여유를 두고 80일씩 자른다."""
+    from datetime import datetime, timedelta
+    b = datetime.strptime(bgn_de, "%Y%m%d")
+    e = datetime.strptime(end_de, "%Y%m%d")
+    out = []
+    while b <= e:
+        chunk_end = min(b + timedelta(days=max_days - 1), e)
+        out.append((b.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")))
+        b = chunk_end + timedelta(days=1)
+    return out
+
+
 def fetch_disclosures(key, bgn_de, end_de):
     """기간 내 공시 중 회생 관련 건만 추린다."""
     found = []
     seen_rcept = set()
+    errors = []
 
     for ty in PBLNTF_TYPES:
+      for sub_bgn, sub_end in split_periods(bgn_de, end_de):
         page = 1
         total_page = 1
         while page <= total_page:
             data, err = call_api("list.json", {
-                "bgn_de": bgn_de,
-                "end_de": end_de,
+                "bgn_de": sub_bgn,
+                "end_de": sub_end,
                 "pblntf_ty": ty,
                 "page_no": page,
                 "page_count": 100,
             }, key)
 
             if err:
-                log(f"  [{ty}] {page}페이지 오류: {err}")
+                # "조회된 데이터가 없습니다"는 오류가 아니라 정상이다
+                if "없습니다" in str(err) and "기간" not in str(err):
+                    break
+                msg = f"[{ty}] {sub_bgn}~{sub_end} {page}페이지: {err}"
+                log("  오류 " + msg)
+                errors.append(msg)
                 break
             if not data:
                 break
@@ -174,9 +208,13 @@ def fetch_disclosures(key, bgn_de, end_de):
                 seen_rcept.add(rcept)
                 found.append(item)
 
-            log(f"  [{ty}] {page}/{total_page} 페이지 조회 — 누적 {len(found)}건")
+            log(f"  [{ty}] {sub_bgn}~{sub_end} {page}/{total_page}페이지 — 누적 {len(found)}건")
             page += 1
             time.sleep(0.15)          # API 예의상 간격
+
+    if errors:
+        log("")
+        log(f"  ⚠️ 조회 실패 {len(errors)}건 — 아래 결과는 일부만 담고 있습니다.")
 
     return found
 
@@ -225,14 +263,35 @@ def fetch_financials(key, corp_code, year):
 # ─────────────────────────────────────────────────────────
 
 def classify_induty(code):
-    """업종코드 → (설명, 전기 관련도 0~3)"""
+    """업종코드 → (설명, 분류, 관련도 0~3)"""
     code = (code or "").strip()
     if not code:
-        return "미상", 0
-    for prefix, label, score in INDUTY_GROUPS:
+        return "미상", "", 0
+    for prefix, label, cat, score in INDUTY_GROUPS:
         if code.startswith(prefix):
-            return f"{label} ({code})", score
-    return f"기타 ({code})", 0
+            return f"{label} ({code})", cat, score
+    return f"기타 ({code})", "", 0
+
+
+def decide_category(corp_name, induty_label, induty_cat, induty_score):
+    """업종코드 분류와 회사명 분류를 합친다.
+
+    DART 업종코드는 상당수가 "기타"로 뭉뚱그려져 있어(2026-08-21 확인)
+    업종만 믿으면 놓친다. 회사명 쪽 판단(categories.py)을 같이 쓴다.
+    """
+    by_name = CAT.classify(corp_name)
+    cats = list(by_name["카테고리"])
+    score = by_name["점수"]
+    if induty_cat:
+        if induty_cat in cats:
+            cats.remove(induty_cat)
+        cats.insert(0, induty_cat)          # 업종코드 쪽을 앞에 둔다
+        score = max(score, induty_score)
+    reason = by_name["근거"]
+    if induty_cat:
+        reason = (f"업종코드:{induty_label}({induty_score})"
+                  + (", " + reason if reason else ""))
+    return "/".join(cats), score, reason
 
 
 def guess_status(report_nm):
@@ -267,7 +326,9 @@ def build_row(item, company, fin, today):
     report_nm = " ".join((item.get("report_nm") or "").split())
     status = guess_status(report_nm)
     rcept_no = item.get("rcept_no", "")
-    induty, score = classify_induty(company.get("induty_code"))
+    corp_name = company.get("corp_name") or item.get("corp_name", "")
+    induty, induty_cat, induty_score = classify_induty(company.get("induty_code"))
+    cats, score, reason = decide_category(corp_name, induty, induty_cat, induty_score)
     date = fmt_date(item.get("rcept_dt"))
 
     viewer = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
@@ -275,7 +336,7 @@ def build_row(item, company, fin, today):
 
     return {
         "수집일자": today,
-        "회사명": company.get("corp_name") or item.get("corp_name", ""),
+        "회사명": corp_name,
         "사업자번호": company.get("bizr_no", ""),
         "대표자명": company.get("ceo_nm", ""),
         "관할법원": "공시원문 확인",
@@ -284,6 +345,8 @@ def build_row(item, company, fin, today):
         "결정일": date if status not in ("신청", "확인필요") else "",
         "사건상태": status,
         "면허/업종": induty,
+        "분류": cats,
+        "판단근거": reason,
         "자본금": fmt_won(fin.get("자본금")) if fin else "",
         "채무액": fmt_won(fin.get("부채총계")) if fin else "",
         "소재지": company.get("adres", ""),
@@ -440,12 +503,21 @@ def main():
     log(f"  → {out_path}")
     log("")
     log("=" * 62)
-    log(f"  신규 {len(rows)}건 저장 | 전기 관련 {len(hits)}건")
+    log(f"  신규 공시 {len(rows)}건 저장 | 해당 업종 공시 {len(hits)}건")
     log("=" * 62)
-    if hits:
-        log("\n  ★ 전기 관련 업체")
-        for r in hits:
-            log(f"     · {r['회사명']} ({r['사건상태']}) — {r['면허/업종']}")
+    # 같은 회사가 공시 건수만큼 반복되므로 회사명으로 묶는다 (2026-08-21)
+    by_corp = {}
+    for r in hits:
+        by_corp.setdefault(r["회사명"], []).append(r)
+
+    if by_corp:
+        log("\n  ★ 건설·전기·소방·설비통신 업체 %d곳" % len(by_corp))
+        for corp, group in sorted(by_corp.items(), key=lambda kv: -kv[1][0]["_score"]):
+            r = group[0]
+            states = "/".join(dict.fromkeys(g["사건상태"] for g in group))
+            more = " (공시 %d건)" % len(group) if len(group) > 1 else ""
+            log(f"     · {corp} [{r.get('분류') or '분류없음'}] {states}{more}")
+            log(f"       {r['면허/업종']}")
             log(f"       {r['소재지']} / {r['전화번호']}")
     log("")
     return 0

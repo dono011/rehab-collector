@@ -31,7 +31,9 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRACK_B = os.path.join(HERE, "track_b_court")
+TRACK_A = os.path.join(HERE, "track_a_dart")
 TRACK_C = os.path.join(HERE, "track_c_insolvency")
+ENV_FILE = os.path.join(HERE, ".env")
 HERMES = "/usr/local/lib/hermes-agent/venv/bin/hermes"
 PY = "/usr/bin/python3"
 
@@ -121,6 +123,81 @@ def detail_of_b(name):
     return out
 
 
+# ── 트랙 A ────────────────────────────────────────────────
+def load_env():
+    """.env 의 DART_API_KEY 를 읽는다. 없으면 None."""
+    try:
+        with open(ENV_FILE, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("DART_API_KEY="):
+                    v = line.split("=", 1)[1].strip()
+                    return v or None
+    except Exception:
+        pass
+    return None
+
+
+def track_a():
+    """DART 공시. 법원 자료에 없는 사업자번호·대표자·전화·자본금을 채워 준다.
+    상장사·공시대상 법인만 나오므로 건수는 적다."""
+    key = load_env()
+    if not key:
+        return [], None          # 키가 없으면 조용히 건너뛴다 (실패 아님)
+
+    seen_path = os.path.join(TRACK_A, "output", "seen.json")
+    before = set(read_json(seen_path, []))
+
+    env = dict(os.environ, DART_API_KEY=key)
+    r = subprocess.run([PY, "collect_rehab.py", "--days", "30"], cwd=TRACK_A,
+                       capture_output=True, text=True, timeout=2400, env=env)
+    sys.stdout.write(r.stdout or "")
+    sys.stdout.write(r.stderr or "")
+    if r.returncode != 0:
+        return None, ((r.stdout or "") + (r.stderr or ""))[-400:]
+
+    after = set(read_json(seen_path, []))
+    if not (after - before):
+        return [], None
+
+    # 새로 들어온 접수번호에 해당하는 줄만 엑셀에서 꺼낸다
+    import glob
+    files = sorted(glob.glob(os.path.join(TRACK_A, "output", "회생신청_정보_*.xlsx")))
+    if not files:
+        return [], None
+    try:
+        from openpyxl import load_workbook
+        ws = load_workbook(files[-1]).active
+    except Exception as e:
+        return None, "엑셀 읽기 실패: %s" % e
+
+    head = [c.value for c in ws[1]]
+    idx = dict((n, i) for i, n in enumerate(head))
+    fresh = after - before
+    by_corp = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        src = str(row[idx.get("데이터출처", 0)] or "")
+        rcept = src.replace("DART ", "").strip()
+        if rcept not in fresh:
+            continue
+        cats = [c for c in str(row[idx.get("분류", 0)] or "").split("/") if c]
+        if not any(c in WANTED for c in cats):
+            continue
+        corp = str(row[idx.get("회사명", 0)] or "")
+        if corp in by_corp:                      # 같은 회사 여러 공시 → 한 줄
+            continue
+        by_corp[corp] = {
+            "회사": corp, "분류": "/".join(cats),
+            "법원": "", "업종": str(row[idx.get("면허/업종", 0)] or ""),
+            "상태": str(row[idx.get("사건상태", 0)] or ""),
+            "자본금": str(row[idx.get("자본금", 0)] or ""),
+            "주소": str(row[idx.get("소재지", 0)] or ""),
+            "연락처": str(row[idx.get("전화번호", 0)] or ""),
+            "사업자번호": str(row[idx.get("사업자번호", 0)] or ""),
+            "구분": "DART공시",
+        }
+    return list(by_corp.values()), None
+
+
 # ── 트랙 C ────────────────────────────────────────────────
 def track_c():
     """회생·파산 공고. 수집기가 신규.json 을 직접 써 준다."""
@@ -172,6 +249,10 @@ def build_message(items):
                 lines.append("  자본금: %s" % it["자본금"])
             if it.get("주소"):
                 lines.append("  주소: %s" % it["주소"])
+            if it.get("사업자번호"):
+                lines.append("  사업자번호: %s" % it["사업자번호"])
+            if it.get("상태"):
+                lines.append("  상태: %s" % it["상태"])
             if it.get("관재인"):
                 lines.append("  관재인: %s" % it["관재인"])
             if it.get("연락처"):
@@ -194,7 +275,8 @@ def main():
 
     items, failures = [], []
 
-    for label, fn in (("매각공고", track_b), ("회생·파산공고", track_c)):
+    for label, fn in (("매각공고", track_b), ("회생·파산공고", track_c),
+                      ("DART공시", track_a)):
         print("\n===== %s =====" % label)
         try:
             got, err = fn()
