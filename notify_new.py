@@ -1,36 +1,46 @@
 # -*- coding: utf-8 -*-
-"""새로 뜬 전기 관련 회생 매각공고만 텔레그램으로 알린다.
+"""새로 뜬 건설·전기·소방 매물만 텔레그램으로 알린다.
 
 만든 이유 (2026-08-21):
-  수집기를 매일 자동으로 돌려도 결과가 VPS 엑셀로만 쌓여서
+  수집기를 매일 자동으로 돌려도 결과가 서버 엑셀로만 쌓여
   새 매물이 떠도 사장님이 알 방법이 없었다.
 
+무엇을 도나:
+  트랙 B — 대법원 M&A 매각공고   (팔려고 내놓은 회사. 매각주간사 전화가 붙는다)
+  트랙 C — 법원 회생·파산 공고    (절차가 열린 회사 전부. 파산은 관재인 전화가 붙는다)
+  두 자료원은 서로 구멍을 메운다. 한쪽만 돌리면 놓친다.
+
 언제 알리나:
-  1) 새 공고가 잡혔을 때          ← 본래 목적
-  2) 수집기가 실패했을 때          ← 조용히 죽는 것을 막는다
+  1) 새 공고가 잡혔을 때          <- 본래 목적
+  2) 수집기가 실패했을 때          <- 조용히 죽는 것을 막는다
 조용하면 정상이다. 매일 "이상 없음"을 보내지 않는다.
 
-발송은 hermes send CLI로 그대로 전달한다. AI가 문장을 새로 짓지 않는다.
+발송은 팩스 감시와 같은 hermes send CLI 를 쓴다. 헤르메스는 그대로 전달만 하고
+문장을 새로 짓지 않는다 (지어내는 문제가 끼어들 여지를 없앤다).
+
+사용법:
+    python3 notify_new.py            # 수집 + 새 것 있으면 알림
+    python3 notify_new.py --quiet    # 수집만 하고 알리지 않음 (처음 채울 때)
 """
+import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRACK_B = os.path.join(HERE, "track_b_court")
-SEEN = os.path.join(TRACK_B, "output", "seen.json")
-DETAIL_DIR = os.path.join(TRACK_B, "output", "detail")
+TRACK_C = os.path.join(HERE, "track_c_insolvency")
 HERMES = "/usr/local/lib/hermes-agent/venv/bin/hermes"
 PY = "/usr/bin/python3"
 
+sys.path.insert(0, HERE)
+import categories as CAT  # noqa: E402
 
-def read_seen():
-    try:
-        with open(SEEN, encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
+# 알릴 업종. 여기 없는 것은 잡혀도 알리지 않는다.
+WANTED = ("건설", "전기", "소방", "설비통신")
+MAX_LINES = 60  # 텔레그램 한 통이 너무 길어지지 않게
 
 
 def send_telegram(text):
@@ -45,16 +55,53 @@ def send_telegram(text):
         return False, str(e)
 
 
-def company_of(key):
-    """seen.json 열쇠 'site|id|회사명' 에서 회사명만 꺼낸다."""
-    parts = key.split("|")
-    return parts[-1].strip() if parts else key
+def run(cwd, argv, timeout=2400):
+    r = subprocess.run([PY] + argv, cwd=cwd, capture_output=True,
+                       text=True, timeout=timeout)
+    sys.stdout.write(r.stdout or "")
+    sys.stdout.write(r.stderr or "")
+    return r
 
 
-def detail_of(name):
-    """공고 원문에서 업종·자본금·연락처를 꺼낸다. 없으면 빈 값."""
-    import re
-    path = os.path.join(DETAIL_DIR, name.replace(" ", "_").replace("/", "_") + ".txt")
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+# ── 트랙 B ────────────────────────────────────────────────
+def track_b():
+    """매각공고. seen.json 을 실행 전후로 비교해 새 것만 골라낸다."""
+    seen_path = os.path.join(TRACK_B, "output", "seen.json")
+    before = set(read_json(seen_path, []))
+
+    r = run(TRACK_B, ["collect_court.py", "--pages", "12", "--detail"])
+    if r.returncode != 0:
+        return None, ((r.stdout or "") + (r.stderr or ""))[-400:]
+
+    after = set(read_json(seen_path, []))
+    items = []
+    for key in sorted(after - before):
+        name = key.split("|")[-1].strip()
+        d = detail_of_b(name)
+        c = CAT.classify(name, d.get("업종", ""))
+        if not any(cat in WANTED for cat in c["카테고리"]):
+            continue
+        items.append({
+            "회사": name, "분류": "/".join(c["카테고리"]),
+            "법원": d.get("법원", ""), "업종": d.get("업종", ""),
+            "자본금": d.get("자본금", ""), "연락처": d.get("연락처", ""),
+            "구분": "매각공고",
+        })
+    return items, None
+
+
+def detail_of_b(name):
+    """매각공고 원문에서 업종·자본금·연락처를 꺼낸다. 없으면 빈 값."""
+    path = os.path.join(TRACK_B, "output", "detail",
+                        name.replace(" ", "_").replace("/", "_") + ".txt")
     if not os.path.exists(path):
         return {}
     try:
@@ -63,11 +110,9 @@ def detail_of(name):
     except Exception:
         return {}
     out = {}
+    stop = r"(?=\s(?:회사|관할법원|업종|회생절차|상장여부|납입자본금|홈페이지|주주의)\s)"
     for label, key in (("업종", "업종"), ("납입자본금", "자본금"), ("관할법원", "법원")):
-        m = re.search(
-            label + r"\s(.{0,80}?)(?=\s(?:회사|관할법원|업종|회생절차|상장여부|납입자본금|홈페이지|주주의)\s)",
-            t,
-        )
+        m = re.search(label + r"\s(.{0,80}?)" + stop, t)
         if m:
             out[key] = m.group(1).strip()
     m = re.search(r"(0\d{1,2}[-)]\s?\d{3,4}-\d{4})", t)
@@ -76,45 +121,103 @@ def detail_of(name):
     return out
 
 
-def main():
-    before = read_seen()
+# ── 트랙 C ────────────────────────────────────────────────
+def track_c():
+    """회생·파산 공고. 수집기가 신규.json 을 직접 써 준다."""
+    new_path = os.path.join(TRACK_C, "output", "신규.json")
+    if os.path.exists(new_path):
+        os.remove(new_path)
 
-    r = subprocess.run(
-        [PY, "collect_court.py", "--pages", "12", "--elec", "--detail"],
-        cwd=TRACK_B, capture_output=True, text=True, timeout=1800,
-    )
-    sys.stdout.write(r.stdout or "")
-    sys.stdout.write(r.stderr or "")
-
+    r = run(TRACK_C, ["collect_insolvency.py"])
     if r.returncode != 0:
-        tail = ((r.stdout or "") + (r.stderr or ""))[-500:]
-        send_telegram("[회생매물 수집] 실패했습니다.\n종료코드 %s\n%s" % (r.returncode, tail))
-        return r.returncode
+        return None, ((r.stdout or "") + (r.stderr or ""))[-400:]
 
-    after = read_seen()
-    new = sorted(after - before)
-    if not new:
-        print("새 공고 없음 — 알리지 않는다")
+    items = []
+    for rec in read_json(new_path, []):
+        cats = [c for c in (rec.get("분류") or "").split("/") if c]
+        if not any(c in WANTED for c in cats):
+            continue
+        items.append({
+            "회사": rec.get("채무자명", ""), "분류": rec.get("분류", ""),
+            "법원": rec.get("법원명", ""), "업종": rec.get("사건구분", ""),
+            "사건번호": rec.get("사건번호", ""), "공고": rec.get("공고제목", ""),
+            "주소": rec.get("회사주소", ""),
+            "관재인": rec.get("관리인_관재인", ""),
+            "연락처": rec.get("관재인_전화", ""),
+            "구분": "회생·파산공고",
+        })
+    return items, None
+
+
+# ── 알림 문구 ──────────────────────────────────────────────
+def build_message(items):
+    by_cat = {}
+    for it in items:
+        head = (it["분류"].split("/")[0] if it["분류"] else "기타")
+        by_cat.setdefault(head, []).append(it)
+
+    lines = ["[매물알림] 새 공고 %d건" % len(items), ""]
+    for cat in WANTED:
+        group = by_cat.get(cat)
+        if not group:
+            continue
+        lines.append("■ %s (%d건)" % (cat, len(group)))
+        for it in group:
+            lines.append("· %s [%s]" % (it["회사"], it["구분"]))
+            bits = [b for b in (it.get("법원"), it.get("업종"),
+                                it.get("사건번호"), it.get("공고")) if b]
+            if bits:
+                lines.append("  " + " / ".join(bits))
+            if it.get("자본금"):
+                lines.append("  자본금: %s" % it["자본금"])
+            if it.get("주소"):
+                lines.append("  주소: %s" % it["주소"])
+            if it.get("관재인"):
+                lines.append("  관재인: %s" % it["관재인"])
+            if it.get("연락처"):
+                lines.append("  연락처: %s" % it["연락처"])
+            else:
+                lines.append("  연락처: 공고에 없음")
+        lines.append("")
+
+    if len(lines) > MAX_LINES:
+        lines = lines[:MAX_LINES] + ["", "(너무 길어 줄임 — 서버 엑셀에 전부 있습니다)"]
+    lines.append("면허 실제 보유 여부는 확인이 필요합니다. 이름으로 추린 결과입니다.")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--quiet", action="store_true",
+                    help="수집만 하고 알리지 않음 (처음 채울 때)")
+    args = ap.parse_args()
+
+    items, failures = [], []
+
+    for label, fn in (("매각공고", track_b), ("회생·파산공고", track_c)):
+        print("\n===== %s =====" % label)
+        try:
+            got, err = fn()
+        except Exception as e:
+            got, err = None, str(e)
+        if err:
+            failures.append("%s: %s" % (label, err))
+        elif got:
+            items.extend(got)
+
+    if failures and not args.quiet:
+        send_telegram("[매물알림] 수집 실패\n\n" + "\n\n".join(failures))
+
+    if not items:
+        print("\n새 공고 없음 — 알리지 않는다")
+        return 1 if failures else 0
+
+    print("\n새 공고 %d건" % len(items))
+    if args.quiet:
+        print("--quiet 이므로 알리지 않는다")
         return 0
 
-    lines = ["[회생매물] 새 전기 관련 매각공고 %d건" % len(new), ""]
-    for key in new:
-        name = company_of(key)
-        d = detail_of(name)
-        lines.append("· %s" % name)
-        if d.get("법원"):
-            lines.append("  법원: %s" % d["법원"])
-        if d.get("업종"):
-            lines.append("  업종: %s" % d["업종"])
-        if d.get("자본금"):
-            lines.append("  자본금: %s" % d["자본금"])
-        if d.get("연락처"):
-            lines.append("  연락처: %s" % d["연락처"])
-        lines.append("")
-    lines.append("전기공사업 면허 실제 보유 여부는 확인이 필요합니다.")
-    text = "\n".join(lines)
-
-    ok, msg = send_telegram(text)
+    ok, msg = send_telegram(build_message(items))
     print("텔레그램 발송:", "성공" if ok else "실패 " + msg)
     return 0
 
