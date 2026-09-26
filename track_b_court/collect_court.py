@@ -24,6 +24,7 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -45,6 +46,9 @@ except ImportError as e:
 import parsers
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "common"))
+import ai_judge
+
 OUT_DIR = HERE / "output"
 SEEN_FILE = OUT_DIR / "seen.json"
 
@@ -401,6 +405,9 @@ def main():
     p.add_argument("--detail", action="store_true",
                    help="공고 원문을 열어 사건번호·관리인·연락처까지 확보 "
                         "(건수만큼 시간이 걸리므로 --elec 와 함께 쓰세요)")
+    p.add_argument("--ai-judge", action="store_true",
+                   help="전기 관련 후보(관련도 2 이상)를 AI로 재판정 (관련도/위험신호/판단근거). "
+                        "기본 제공자는 Jev — 환경변수 AI_JUDGE_PROVIDER=claude|openai 로 변경 가능")
     args = p.parse_args()
 
     if args.codes:
@@ -515,6 +522,23 @@ def main():
                 row["비고"] = (" / ".join(extra) + " | " + row["비고"])[:400]
             time.sleep(DELAY)
         log(f"\n  원문 저장 위치: {detail_dir}")
+
+    if args.ai_judge:
+        provider = os.environ.get("AI_JUDGE_PROVIDER", "jev")
+        targets = [r for r in new_rows if r["_score"] >= 2]
+        log(f"\n[AI 판정] provider={provider} — 전기 관련 후보 {len(targets)}건")
+        for n, row in enumerate(targets, 1):
+            result = ai_judge.judge_candidate(
+                row["회사명"], row.get("비고", ""), row.get("_link", ""))
+            if not result or result.get("_error"):
+                log(f"  [{n}/{len(targets)}] {row['회사명']} — 판정 실패: "
+                    f"{(result or {}).get('_error', '응답 없음')}")
+                continue
+            tag = (f"[AI:{result.get('_provider','')}] "
+                   f"관련도={result.get('관련도','')} 위험={result.get('위험신호','')} "
+                   f"— {result.get('판단근거','')}")
+            row["비고"] = (tag + " | " + row["비고"])[:400]
+            log(f"  [{n}/{len(targets)}] {row['회사명']} — {tag}")
 
     log("\n[3/3] 엑셀 저장")
     out_path = OUT_DIR / f"법원공고_회생업체_{today:%Y%m%d}.xlsx"

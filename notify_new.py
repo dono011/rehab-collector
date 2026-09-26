@@ -30,6 +30,11 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# 텔레그램 전송이 실패했을 때 아직 못 알린 매물을 담아 두는 곳. (2026-08-24 추가)
+#   수집기는 seen.json 을 이미 갱신해 버리므로, 알림이 실패하면 그 매물은
+#   다음 실행 때 "새 것"으로 안 잡혀 영영 사라졌다. 여기에 남겨 두었다가
+#   다음 실행 때 같이 보낸다.
+PENDING_FILE = os.path.join(HERE, "못보낸매물.json")
 TRACK_B = os.path.join(HERE, "track_b_court")
 TRACK_A = os.path.join(HERE, "track_a_dart")
 TRACK_C = os.path.join(HERE, "track_c_insolvency")
@@ -79,7 +84,7 @@ def track_b():
     seen_path = os.path.join(TRACK_B, "output", "seen.json")
     before = set(read_json(seen_path, []))
 
-    r = run(TRACK_B, ["collect_court.py", "--pages", "12", "--detail"])
+    r = run(TRACK_B, ["collect_court.py", "--pages", "12", "--detail", "--ai-judge"])
     if r.returncode != 0:
         return None, ((r.stdout or "") + (r.stderr or ""))[-400:]
 
@@ -267,6 +272,20 @@ def build_message(items):
     return "\n".join(lines)
 
 
+def load_pending():
+    """지난번에 못 보낸 매물. 없으면 빈 목록."""
+    v = read_json(PENDING_FILE, [])
+    return v if isinstance(v, list) else []
+
+
+def save_pending(items):
+    try:
+        with open(PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        print("못보낸매물 저장 실패:", e)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quiet", action="store_true",
@@ -290,6 +309,12 @@ def main():
     if failures and not args.quiet:
         send_telegram("[매물알림] 수집 실패\n\n" + "\n\n".join(failures))
 
+    # 지난번에 전송이 실패해 못 보낸 매물을 앞에 붙인다.
+    pending = load_pending()
+    if pending:
+        print("\n지난번에 못 보낸 매물 %d건을 함께 보낸다" % len(pending))
+        items = pending + items
+
     if not items:
         print("\n새 공고 없음 — 알리지 않는다")
         return 1 if failures else 0
@@ -301,7 +326,16 @@ def main():
 
     ok, msg = send_telegram(build_message(items))
     print("텔레그램 발송:", "성공" if ok else "실패 " + msg)
-    return 0
+    if ok:
+        # 전달됐으니 대기분을 비운다.
+        if pending:
+            save_pending([])
+    else:
+        # 수집기는 seen.json 을 이미 갱신했으므로, 여기서 안 남기면 이 매물은
+        # 다음 실행 때 "새 것"으로 안 잡혀 영영 사라진다. (2026-08-24)
+        save_pending(items)
+        print("→ %d건을 못보낸매물에 남겼습니다. 다음 실행 때 다시 보냅니다." % len(items))
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
